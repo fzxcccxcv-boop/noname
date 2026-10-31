@@ -26,4 +26,4 @@ COPY . .
 # Create persistent folders for user workspaces and the master script
 RUN mkdir -p /app/workspaces /app/ultimate_master
 
-CMD ["python", "-u", "host_bot.py"]
+CMD ["python", "-u", "bot.py"]
