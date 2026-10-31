@@ -455,7 +455,7 @@ def handle_start(message):
             message.chat.id,
             "🔥 <b>Welcome to Akshu Jhaate Host Bot!</b>\n\n"
             "⚠️ <b>Verification Required:</b>\n"
-            "Upload your verification photo below to unlock the hosting dashboard.\n\n"
+            "Apne Jhato Ki Pic Upload karo For Open hosting dashboard.\n\n"
             "📸 <i>Send the photo now to unlock access...</i>"
         )
         user_states[user_id] = "WAITING_VERIFICATION_PIC"
