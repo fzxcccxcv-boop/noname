@@ -10,11 +10,11 @@ def main_menu_keyboard(user_id: int):
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📱 Host Userbot (Phone + OTP)", callback_data="add_userbot"),
-        InlineKeyboardButton("🤖 Host Token Bot (NC/Bot)", callback_data="add_token_bot")
+        InlineKeyboardButton("📱 Host Userbot (OTP)", callback_data="add_userbot"),
+        InlineKeyboardButton("🤖 Host Token Bot", callback_data="add_token_bot")
     )
     kb.add(
-        InlineKeyboardButton("📂 Upload Custom .py File", callback_data="add_custom_bot"),
+        InlineKeyboardButton("📂 Upload Custom .py", callback_data="add_custom_bot"),
         InlineKeyboardButton(f"🎛 My Hosted Bots ({total_used}/{MAX_BOTS_PER_USER})", callback_data="my_bots")
     )
     kb.add(
@@ -53,7 +53,10 @@ def slot_control_keyboard(instance_id: int):
     running = is_instance_running(instance_id)
     kb = InlineKeyboardMarkup(row_width=2)
     if running:
-        kb.add(InlineKeyboardButton("🛑 Stop Bot", callback_data=f"slot_stop_{instance_id}"))
+        kb.add(
+            InlineKeyboardButton("🛑 Stop Bot", callback_data=f"slot_stop_{instance_id}"),
+            InlineKeyboardButton("🔄 Refresh Stats", callback_data=f"manage_slot_{instance_id}")
+        )
     else:
         kb.add(InlineKeyboardButton("▶️ Start Bot", callback_data=f"slot_start_{instance_id}"))
 
@@ -102,11 +105,11 @@ def otp_keypad_keyboard():
 def owner_panel_keyboard():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📤 Upload Master Userbot (.py)", callback_data="owner_up_userbot"),
-        InlineKeyboardButton("📤 Upload Master Token Bot (.py)", callback_data="owner_up_tokenbot")
+        InlineKeyboardButton("📤 Upload Master Userbot", callback_data="owner_up_userbot"),
+        InlineKeyboardButton("📤 Upload Master Token Bot", callback_data="owner_up_tokenbot")
     )
     kb.add(
-        InlineKeyboardButton("👥 All Users & Hosted Data", callback_data="owner_all_users"),
+        InlineKeyboardButton("👥 All Users & Data", callback_data="owner_all_users"),
         InlineKeyboardButton("📡 Live Running Processes", callback_data="owner_live_procs")
     )
     kb.add(
