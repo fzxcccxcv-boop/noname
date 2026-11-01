@@ -2,10 +2,3 @@ pyTelegramBotAPI==4.22.1
 pyrotgfork==2.2.6
 tgcrypto==1.2.5
 psutil==6.0.0
-requests==2.32.3
-aiohttp==3.10.5
-python-dotenv==1.0.1
-pymongo==4.8.0
-motor==3.5.1
-dnspython==2.6.1
-Pillow==10.4.0
