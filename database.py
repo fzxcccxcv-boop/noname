@@ -7,7 +7,6 @@ def get_conn():
 def init_db():
     conn = get_conn()
     c = conn.cursor()
-    # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
@@ -15,7 +14,6 @@ def init_db():
                     joined_at TEXT,
                     bot_limit INTEGER DEFAULT 10
                 )''')
-    # Hosted instances table (supports up to 10 bots per user)
     c.execute('''CREATE TABLE IF NOT EXISTS hosted_bots (
                     instance_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -134,3 +132,14 @@ def get_all_users_summary():
     users = c.fetchall()
     conn.close()
     return users
+
+def get_previously_running_instances():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT instance_id, user_id, bot_type, label "
+        "FROM hosted_bots WHERE status = 'running' ORDER BY instance_id ASC"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
