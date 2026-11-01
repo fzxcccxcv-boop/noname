@@ -2,10 +2,10 @@ import os
 from datetime import datetime, timezone, timedelta
 
 # ================= ENVIRONMENT CONFIGURATION =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_MAIN_HOST_BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
-API_ID = int(os.environ.get("API_ID", "1234567"))
-API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8570478868:AAGRM_w35z1kFdZbWLksjcPpB8M1l6TX41s")
+OWNER_ID = int(os.environ.get("OWNER_ID", "8684812026"))
+API_ID = int(os.environ.get("API_ID", "35222361"))
+API_HASH = os.environ.get("API_HASH", "37e25f9cff15259a786c55da0b0af3f3")
 
 # Hosting limits
 MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "10"))
