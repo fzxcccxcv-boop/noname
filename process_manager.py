@@ -1,9 +1,17 @@
 import os
 import sys
 import time
+import signal
 import psutil
 import threading
 import subprocess
+
+try:
+    import resource
+    HAS_RESOURCE_MODULE = True
+except ImportError:
+    HAS_RESOURCE_MODULE = False
+
 from config import (
     OWNER_ID,
     API_ID,
@@ -21,13 +29,20 @@ from database import (
     get_previously_running_instances
 )
 
-# Active subprocess dictionary: {instance_id: subprocess.Popen}
+# ================= RESOURCE LIMIT CONFIGURATION =================
+MAX_RAM_MB = int(os.environ.get("MAX_RAM_MB", "150"))
+MAX_RAM_BYTES = MAX_RAM_MB * 1024 * 1024
+MAX_CPU_PERCENT = float(os.environ.get("MAX_CPU_PERCENT", "85.0"))
+MAX_CPU_STRIKES = 3
+MAX_FILE_WRITE_BYTES = 50 * 1024 * 1024
+MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
+
 active_processes = {}
-# Crash retry counter for the watchdog: {instance_id: int}
 crash_retries = {}
+cpu_strikes = {}
+psutil_cache = {}
 MAX_CRASH_RETRIES = 3
 
-# ================= DEFAULT MASTER SCRIPTS =================
 DEFAULT_MASTER_USERBOT = '''import os
 import sys
 import time
@@ -47,14 +62,14 @@ app = Client(f"userbot_{INSTANCE_ID}", api_id=API_ID, api_hash=API_HASH, session
 @app.on_message(filters.command("alive", prefixes=[".", "/"]) & filters.me)
 async def alive_cmd(client, message):
     uptime = int(time.time() - START_TIME)
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
+    proc = psutil.Process(os.getpid())
+    ram_mb = proc.memory_info().rss / (1024 * 1024)
     await message.reply_text(
         f"⚡ **Akshu Host — Master Userbot Active**\\n\\n"
         f"🆔 **Slot ID:** `#{INSTANCE_ID}`\\n"
         f"👤 **Owner ID:** `{HOSTED_USER_ID}`\\n"
         f"⏱ **Uptime:** `{uptime}s`\\n"
-        f"💻 **CPU / RAM:** `{cpu}%` | `{ram}%`"
+        f"🧠 **Slot RAM:** `{ram_mb:.1f} MB / 150 MB`"
     )
 
 @app.on_message(filters.command("ping", prefixes=[".", "/"]) & filters.me)
@@ -83,15 +98,15 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 @bot.message_handler(commands=['start', 'alive'])
 def start_cmd(message):
     uptime = int(time.time() - START_TIME)
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
+    proc = psutil.Process(os.getpid())
+    ram_mb = proc.memory_info().rss / (1024 * 1024)
     bot.reply_to(
         message,
         f"🤖 <b>Akshu Host — Master Token Bot Active!</b>\\n\\n"
         f"🆔 <b>Slot ID:</b> <code>#{INSTANCE_ID}</code>\\n"
         f"👤 <b>Hosted By:</b> <code>{HOSTED_USER_ID}</code>\\n"
         f"⏱ <b>Uptime:</b> <code>{uptime}s</code>\\n"
-        f"💻 <b>CPU / RAM:</b> <code>{cpu}%</code> | <code>{ram}%</code>"
+        f"🧠 <b>Slot RAM:</b> <code>{ram_mb:.1f} MB / 150 MB</code>"
     )
 
 @bot.message_handler(commands=['ping'])
@@ -115,7 +130,77 @@ def ensure_master_scripts():
 
 ensure_master_scripts()
 
-# ================= INSTANCE PROCESS CONTROLS =================
+def _apply_os_resource_limits():
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    try:
+        os.nice(10)
+    except Exception:
+        pass
+    if HAS_RESOURCE_MODULE:
+        try:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_FILE_WRITE_BYTES, MAX_FILE_WRITE_BYTES))
+        except Exception:
+            pass
+        try:
+            vmem_ceiling = 768 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (vmem_ceiling, vmem_ceiling))
+        except Exception:
+            pass
+
+def _kill_process_tree(proc: subprocess.Popen):
+    if proc is None:
+        return
+    try:
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+    except psutil.NoSuchProcess:
+        pass
+
+    if os.name != "nt":
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+    try:
+        proc.kill()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+def get_slot_resource_usage(instance_id: int):
+    proc = active_processes.get(instance_id)
+    if not proc or proc.poll() is not None:
+        return 0.0, 0.0
+    try:
+        if instance_id not in psutil_cache or psutil_cache[instance_id].pid != proc.pid:
+            p = psutil.Process(proc.pid)
+            p.cpu_percent(interval=None)
+            psutil_cache[instance_id] = p
+        else:
+            p = psutil_cache[instance_id]
+
+        rss_bytes = p.memory_info().rss
+        cpu_pct = p.cpu_percent(interval=None)
+
+        for child in p.children(recursive=True):
+            try:
+                rss_bytes += child.memory_info().rss
+                cpu_pct += child.cpu_percent(interval=None)
+            except psutil.NoSuchProcess:
+                pass
+
+        return rss_bytes / (1024 * 1024), cpu_pct
+    except Exception:
+        return 0.0, 0.0
+
 def is_instance_running(instance_id: int) -> bool:
     proc = active_processes.get(instance_id)
     return proc is not None and proc.poll() is None
@@ -134,11 +219,16 @@ def start_instance(instance_id: int, reset_retries: bool = True):
     os.makedirs(user_workspace, exist_ok=True)
     log_path = os.path.join(user_workspace, "session.log")
 
+    if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_LOG_FILE_BYTES:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"--- [LOG TRUNCATED AT {get_ist_now()}] ---\n")
+
     env = os.environ.copy()
     env["API_ID"] = str(API_ID)
     env["API_HASH"] = API_HASH
     env["HOSTED_USER_ID"] = str(user_id)
     env["INSTANCE_ID"] = str(inst_id)
+    env["MALLOC_TRIM_THRESHOLD_"] = "65536"
 
     if bot_type == "userbot":
         if not credential:
@@ -165,21 +255,34 @@ def start_instance(instance_id: int, reset_retries: bool = True):
         return False, "❌ Unknown bot type."
 
     log_file = open(log_path, "a", encoding="utf-8")
-    log_file.write(f"\n--- [SESSION LAUNCHED AT {get_ist_now()}] ---\n")
+    log_file.write(f"\n--- [SESSION LAUNCHED AT {get_ist_now()} | RAM CAP: {MAX_RAM_MB}MB] ---\n")
     log_file.flush()
 
-    proc = subprocess.Popen(
-        [sys.executable, "-u", script_path],
-        cwd=user_workspace,
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE,
-        text=True
-    )
+    popen_kwargs = {
+        "cwd": user_workspace,
+        "env": env,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.PIPE,
+        "text": True
+    }
+    if os.name != "nt":
+        popen_kwargs["preexec_fn"] = _apply_os_resource_limits
+
+    proc = subprocess.Popen([sys.executable, "-u", script_path], **popen_kwargs)
+
     now_epoch = time.time()
     now_str = get_ist_now()
     active_processes[inst_id] = proc
+    cpu_strikes[inst_id] = 0
+
+    try:
+        p = psutil.Process(proc.pid)
+        p.cpu_percent(interval=None)
+        psutil_cache[inst_id] = p
+    except Exception:
+        pass
+
     if reset_retries:
         crash_retries[inst_id] = 0
     update_instance_status(inst_id, "running", proc.pid, now_epoch, now_str)
@@ -189,23 +292,21 @@ def start_instance(instance_id: int, reset_retries: bool = True):
         f"🏷 <b>Label:</b> <code>{label}</code>\n"
         f"⚙️ <b>Type:</b> <code>{bot_type.upper()}</code>\n"
         f"🆔 <b>PID:</b> <code>{proc.pid}</code>\n"
+        f"🛡️ <b>Resource Cap:</b> <code>{MAX_RAM_MB} MB RAM</code>\n"
         f"🕒 <b>Started:</b> <code>{now_str}</code>"
     )
 
 def stop_instance(instance_id: int):
     crash_retries.pop(instance_id, None)
+    cpu_strikes.pop(instance_id, None)
+    psutil_cache.pop(instance_id, None)
+
     if not is_instance_running(instance_id):
         update_instance_status(instance_id, "stopped")
         return False, f"⚠️ Slot #{instance_id} is not currently running."
 
-    proc = active_processes[instance_id]
-    proc.terminate()
-    try:
-        proc.wait(timeout=4)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-    active_processes.pop(instance_id, None)
+    proc = active_processes.pop(instance_id, None)
+    _kill_process_tree(proc)
     update_instance_status(instance_id, "stopped")
     return True, f"🛑 <b>Slot #{instance_id}</b> stopped cleanly."
 
@@ -226,52 +327,85 @@ def get_instance_logs(user_id: int, instance_id: int) -> str:
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()[-3500:] or "Log file is empty."
 
-# ================= STARTUP RECOVERY & AUTO-RESTART WATCHDOG =================
 def recover_running_instances(bot=None):
-    """Automatically restarts all bots that were marked 'running' prior to a container reboot."""
     rows = get_previously_running_instances()
     if not rows:
-        print("ℹ️ [Startup Recovery] No previously running slots found in database.")
         return
-
-    print(f"🔄 [Startup Recovery] Found {len(rows)} active slot(s) to restore...")
-    restored = []
-    failed = []
-
     for inst_id, user_id, bot_type, label in rows:
-        ok, _ = start_instance(inst_id, reset_retries=True)
-        if ok:
-            pid = active_processes[inst_id].pid
-            restored.append(f"• Slot <code>#{inst_id}</code> ({bot_type.upper()} - <code>{label}</code>) → PID <code>{pid}</code>")
-            print(f"  ✅ Restored Slot #{inst_id} ({label}) [PID {pid}]")
-        else:
-            failed.append(f"• Slot <code>#{inst_id}</code> (<code>{label}</code>)")
-            print(f"  ❌ Failed to restore Slot #{inst_id} ({label})")
-        time.sleep(0.5)  # Stagger process launches to avoid CPU spike on Railway
+        start_instance(inst_id, reset_retries=True)
+        time.sleep(0.5)
 
-    if bot:
-        report = (
-            f"♻️ <b>Container Reboot — Startup Recovery Report</b>\n"
-            f"🕒 <b>Time:</b> <code>{get_ist_now()}</code>\n\n"
-            f"✅ <b>Restored ({len(restored)}):</b>\n" +
-            ("\n".join(restored) if restored else "<i>None</i>")
-        )
-        if failed:
-            report += f"\n\n❌ <b>Failed ({len(failed)}):</b>\n" + "\n".join(failed)
-        try:
-            bot.send_message(OWNER_ID, report[:4000])
-        except Exception:
-            pass
+def _append_violation_log(user_id: int, inst_id: int, reason: str):
+    log_path = os.path.join(WORKSPACES_DIR, str(user_id), f"slot_{inst_id}", "session.log")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n🚨 [RESOURCE GUARD KILLED PROCESS AT {get_ist_now()}]: {reason}\n")
+    except Exception:
+        pass
 
-def _watchdog_loop(bot=None, interval: int = 30):
-    """Background loop that monitors active_processes and auto-restarts crashed slots."""
+def _watchdog_loop(bot=None, interval: int = 5):
     while True:
         time.sleep(interval)
         for inst_id, proc in list(active_processes.items()):
             exit_code = proc.poll()
-            if exit_code is not None:
-                # Process exited unexpectedly without stop_instance() being called
+            if exit_code is None:
+                ram_mb, cpu_pct = get_slot_resource_usage(inst_id)
+                if ram_mb > MAX_RAM_MB:
+                    row = get_instance(inst_id)
+                    user_id = row[1] if row else OWNER_ID
+                    label = row[3] if row else f"Slot #{inst_id}"
+
+                    active_processes.pop(inst_id, None)
+                    cpu_strikes.pop(inst_id, None)
+                    psutil_cache.pop(inst_id, None)
+                    _kill_process_tree(proc)
+                    update_instance_status(inst_id, "stopped")
+                    _append_violation_log(user_id, inst_id, f"Exceeded {MAX_RAM_MB} MB RAM (Used {ram_mb:.1f} MB)")
+
+                    if bot:
+                        try:
+                            bot.send_message(
+                                user_id,
+                                f"🚨 <b>Slot #{inst_id} (<code>{label}</code>) Killed — RAM Limit Exceeded!</b>\n\n"
+                                f"🧠 <b>RAM Used:</b> <code>{ram_mb:.1f} MB</code> / <code>{MAX_RAM_MB} MB</code>\n"
+                                f"<i>Process terminated to protect server stability.</i>"
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+                if cpu_pct > MAX_CPU_PERCENT:
+                    cpu_strikes[inst_id] = cpu_strikes.get(inst_id, 0) + 1
+                    if cpu_strikes[inst_id] >= MAX_CPU_STRIKES:
+                        row = get_instance(inst_id)
+                        user_id = row[1] if row else OWNER_ID
+                        label = row[3] if row else f"Slot #{inst_id}"
+
+                        active_processes.pop(inst_id, None)
+                        cpu_strikes.pop(inst_id, None)
+                        psutil_cache.pop(inst_id, None)
+                        _kill_process_tree(proc)
+                        update_instance_status(inst_id, "stopped")
+                        _append_violation_log(user_id, inst_id, f"Sustained CPU overload ({cpu_pct:.1f}%)")
+
+                        if bot:
+                            try:
+                                bot.send_message(
+                                    user_id,
+                                    f"🚨 <b>Slot #{inst_id} (<code>{label}</code>) Killed — CPU Freeze!</b>\n\n"
+                                    f"⚡ <b>CPU Load:</b> <code>{cpu_pct:.1f}%</code> (Sustained)\n"
+                                    f"<i>Process terminated to prevent server freeze.</i>"
+                                )
+                            except Exception:
+                                pass
+                        continue
+                else:
+                    cpu_strikes[inst_id] = 0
+            else:
                 active_processes.pop(inst_id, None)
+                cpu_strikes.pop(inst_id, None)
+                psutil_cache.pop(inst_id, None)
+
                 row = get_instance(inst_id)
                 if not row or row[6] != "running":
                     continue
@@ -281,76 +415,55 @@ def _watchdog_loop(bot=None, interval: int = 30):
                 crash_retries[inst_id] = retries
 
                 if retries <= MAX_CRASH_RETRIES:
-                    print(f"⚠️ [Watchdog] Slot #{inst_id} ({label}) crashed (code {exit_code}). Auto-restarting ({retries}/{MAX_CRASH_RETRIES})...")
-                    ok, _ = start_instance(inst_id, reset_retries=False)
-                    if ok and bot:
-                        try:
-                            bot.send_message(
-                                user_id,
-                                f"♻️ <b>Auto-Restart Notice:</b>\n"
-                                f"Your Slot <code>#{inst_id}</code> (<code>{label}</code>) exited unexpectedly and was automatically restarted (Attempt <code>{retries}/{MAX_CRASH_RETRIES}</code>)."
-                            )
-                        except Exception:
-                            pass
+                    start_instance(inst_id, reset_retries=False)
                 else:
-                    print(f"🛑 [Watchdog] Slot #{inst_id} ({label}) exceeded max crash retries. Marking stopped.")
                     update_instance_status(inst_id, "stopped")
                     if bot:
                         try:
                             bot.send_message(
                                 user_id,
                                 f"❌ <b>Slot #{inst_id} (<code>{label}</code>) Stopped:</b>\n"
-                                f"Process crashed {MAX_CRASH_RETRIES} times in a row. Check <b>📜 View Logs</b> to fix the error."
+                                f"Crashed {MAX_CRASH_RETRIES} consecutive times. Check logs."
                             )
                         except Exception:
                             pass
 
-def start_watchdog_thread(bot=None, interval: int = 30):
-    """Starts the background watchdog daemon thread."""
+def start_watchdog_thread(bot=None, interval: int = 5):
     t = threading.Thread(target=_watchdog_loop, args=(bot, interval), daemon=True)
     t.start()
-    print(f"🛡️ [Watchdog] Crash monitor active (checking every {interval}s).")
 
-# ================= SAFE MINI-TERMINAL ENGINE =================
 def run_mini_terminal(user_id: int, cmd_text: str) -> str:
-    """Executes safe, built-in diagnostic mini-terminal commands."""
     cmd = cmd_text.strip().lower()
     instances = get_user_instances(user_id)
 
     if cmd in ("help", "?"):
         return (
             "💻 <b>Akshu Mini-Terminal Commands:</b>\n"
-            "• <code>ps</code> — List your hosted bot slots & live PIDs\n"
-            "• <code>sysinfo</code> — View server CPU, RAM & Disk usage\n"
-            "• <code>uptime</code> — Check live uptime of your active bots\n"
-            "• <code>files</code> — List files in your personal workspace\n"
-            "• <code>pip list</code> — View installed Python packages"
+            "• <code>ps</code> — List hosted slots with live RAM & CPU%\n"
+            "• <code>sysinfo</code> — View server CPU, RAM & Disk\n"
+            "• <code>uptime</code> — Active bot uptime\n"
+            "• <code>files</code> — Workspace contents\n"
+            "• <code>pip list</code> — Installed packages"
         )
-
     elif cmd == "ps":
         if not instances:
             return "No bot slots created yet."
-        lines = ["PID     | SLOT | TYPE      | STATUS"]
-        lines.append("-" * 40)
+        lines = [f"PID     | SLOT | RAM (MAX {MAX_RAM_MB}M) | CPU%  | STATUS"]
+        lines.append("-" * 54)
         for r in instances:
-            inst_id, _, btype, label, _, _, _, pid, _, _ = r
+            inst_id, _, btype, label, _, _, _, _, _, _ = r
             running = is_instance_running(inst_id)
-            st = "RUNNING" if running else "STOPPED"
-            live_pid = active_processes[inst_id].pid if running else 0
-            lines.append(f"{str(live_pid):<7} | #{inst_id:<3} | {btype:<9} | {st} ({label})")
+            if running:
+                live_pid = active_processes[inst_id].pid
+                ram_mb, cpu_pct = get_slot_resource_usage(inst_id)
+                lines.append(f"{str(live_pid):<7} | #{inst_id:<3} | {ram_mb:.1f} MB       | {cpu_pct:.1f}%  | RUN ({label})")
+            else:
+                lines.append(f"0       | #{inst_id:<3} | 0.0 MB       | 0.0%  | STOP ({label})")
         return "\n".join(lines)
-
     elif cmd == "sysinfo":
-        cpu = psutil.cpu_percent(interval=0.3)
+        cpu = psutil.cpu_percent(interval=0.2)
         ram = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        return (
-            f"CPU Usage   : {cpu}%\n"
-            f"RAM Usage   : {ram.percent}% ({ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB)\n"
-            f"Disk Usage  : {disk.percent}%\n"
-            f"Python Ver  : {sys.version.split()[0]}"
-        )
-
+        return f"CPU: {cpu}%\nRAM: {ram.percent}% ({ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB)\nSlot Cap: {MAX_RAM_MB}MB RAM"
     elif cmd == "uptime":
         if not instances:
             return "No hosted bots found."
@@ -358,21 +471,19 @@ def run_mini_terminal(user_id: int, cmd_text: str) -> str:
         for r in instances:
             inst_id, _, btype, label, _, _, _, _, start_ep, start_str = r
             if is_instance_running(inst_id):
-                lines.append(f"🟢 Slot #{inst_id} ({label}): Up for {format_uptime(start_ep)} (Since {start_str})")
+                ram_mb, _ = get_slot_resource_usage(inst_id)
+                lines.append(f"🟢 Slot #{inst_id} ({label}): Up {format_uptime(start_ep)} | RAM: {ram_mb:.1f}MB")
             else:
                 lines.append(f"🔴 Slot #{inst_id} ({label}): Offline")
         return "\n".join(lines)
-
     elif cmd == "files":
         u_dir = os.path.join(WORKSPACES_DIR, str(user_id))
         if not os.path.exists(u_dir):
             return "Workspace is empty."
         items = os.listdir(u_dir)
         return "Workspace contents:\n" + ("\n".join(f"• {x}" for x in items) if items else "Empty")
-
     elif cmd == "pip list":
         res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True, timeout=15)
         return res.stdout[-3000:]
-
     else:
-        return f"Unknown mini-terminal command: '{cmd}'. Type 'help' for supported commands."
+        return f"Unknown command: '{cmd}'. Type 'help'."
